@@ -7,11 +7,16 @@ description = "An OpenAPI client generator - core implementation"
 repository = "https://github.com/oxidecomputer/progenitor.git"
 readme = "../README.md"
 
+[features]
+default = ["openapi-3-1"]
+openapi-3-1 = ["dep:openapiv3_1"]
+
 [dependencies]
 heck = { workspace = true }
 http = { workspace = true }
 indexmap = { workspace = true }
 openapiv3 = { workspace = true }
+openapiv3_1 = { workspace = true, optional = true }
 proc-macro2 = { workspace = true }
 quote = { workspace = true }
 regex = { workspace = true }

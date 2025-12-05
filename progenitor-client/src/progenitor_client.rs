@@ -268,7 +268,7 @@ impl<T> ResponseValue<T> {
     }
 
     #[doc(hidden)]
-    pub fn map<U: std::fmt::Debug, F, E>(self, f: F) -> Result<ResponseValue<U>, E>
+    pub fn map<U: std::fmt::Debug, F>(self, f: F) -> ResponseValue<U>
     where
         F: FnOnce(T) -> U,
     {
@@ -278,11 +278,11 @@ impl<T> ResponseValue<T> {
             headers,
         } = self;
 
-        Ok(ResponseValue {
+        ResponseValue {
             inner: f(inner),
             status,
             headers,
-        })
+        }
     }
 }
 

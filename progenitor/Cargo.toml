@@ -10,8 +10,9 @@ keywords = ["openapi", "openapiv3", "sdk", "generator", "proc_macro"]
 categories = ["api-bindings", "compilers"]
 
 [features]
-default = ["macro"]
+default = ["macro", "openapi-3-1"]
 macro = ["dep:progenitor-client", "dep:progenitor-macro"]
+openapi-3-1 = ["progenitor-impl/openapi-3-1", "progenitor-macro?/openapi-3-1"]
 
 [dependencies]
 progenitor-client = { workspace = true, optional = true }

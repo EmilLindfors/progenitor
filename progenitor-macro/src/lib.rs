@@ -7,10 +7,13 @@
 use std::{
     collections::HashMap,
     fs::File,
+    io::Read,
     path::{Path, PathBuf},
 };
 
 use openapiv3::OpenAPI;
+#[cfg(feature = "openapi-3-1")]
+use openapiv3_1::OpenApi as OpenAPI31;
 use proc_macro::TokenStream;
 use progenitor_impl::{
     CrateVers, GenerationSettings, Generator, InterfaceStyle, TagStyle, TypePatch, UnknownPolicy,
@@ -347,25 +350,65 @@ fn do_generate_api(item: TokenStream) -> Result<TokenStream, syn::Error> {
     let path = dir.join(spec.value());
     let path_str = path.to_string_lossy();
 
+    // Read file content first to detect version
     let mut f = open_file(path.clone(), spec.span())?;
-    let oapi: OpenAPI = match serde_json::from_reader(f) {
-        Ok(json_value) => json_value,
-        _ => {
-            f = open_file(path.clone(), spec.span())?;
-            serde_yaml::from_reader(f).map_err(|e| {
-                syn::Error::new(spec.span(), format!("failed to parse {}: {}", path_str, e))
-            })?
-        }
-    };
+    let mut content = String::new();
+    f.read_to_string(&mut content).map_err(|e| {
+        syn::Error::new(spec.span(), format!("couldn't read file {}: {}", path_str, e))
+    })?;
+
+    // Parse as generic JSON/YAML to detect version
+    let json_value: serde_json::Value = serde_json::from_str(&content)
+        .or_else(|_| serde_yaml::from_str(&content))
+        .map_err(|e| {
+            syn::Error::new(spec.span(), format!("failed to parse {}: {}", path_str, e))
+        })?;
+
+    let version = json_value
+        .get("openapi")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            syn::Error::new(spec.span(), format!("missing 'openapi' field in {}", path_str))
+        })?;
 
     let mut builder = Generator::new(&settings);
 
-    let code = builder.generate_tokens(&oapi).map_err(|e| {
-        syn::Error::new(
+    let code = if version.starts_with("3.1.") {
+        #[cfg(feature = "openapi-3-1")]
+        {
+            let oapi: OpenAPI31 = serde_json::from_value(json_value).map_err(|e| {
+                syn::Error::new(spec.span(), format!("failed to parse OpenAPI 3.1 {}: {}", path_str, e))
+            })?;
+            builder.generate_tokens_3_1(&oapi).map_err(|e| {
+                syn::Error::new(
+                    spec.span(),
+                    format!("generation error for {}: {}", spec.value(), e),
+                )
+            })?
+        }
+        #[cfg(not(feature = "openapi-3-1"))]
+        {
+            return Err(syn::Error::new(
+                spec.span(),
+                format!("OpenAPI 3.1 support requires the 'openapi-3-1' feature: {}", path_str),
+            ));
+        }
+    } else if version.starts_with("3.0.") {
+        let oapi: OpenAPI = serde_json::from_value(json_value).map_err(|e| {
+            syn::Error::new(spec.span(), format!("failed to parse OpenAPI 3.0 {}: {}", path_str, e))
+        })?;
+        builder.generate_tokens(&oapi).map_err(|e| {
+            syn::Error::new(
+                spec.span(),
+                format!("generation error for {}: {}", spec.value(), e),
+            )
+        })?
+    } else {
+        return Err(syn::Error::new(
             spec.span(),
-            format!("generation error for {}: {}", spec.value(), e),
-        )
-    })?;
+            format!("unsupported OpenAPI version '{}' in {}", version, path_str),
+        ));
+    };
 
     let output = quote! {
         // The progenitor_client is tautologically visible from macro

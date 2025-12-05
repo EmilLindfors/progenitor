@@ -79,6 +79,24 @@ struct MethodSigBody {
     success: TokenStream,
     error: TokenStream,
     body: TokenStream,
+    /// Optional enum definitions for success/error types when multiple response types exist
+    enum_definitions: Vec<TokenStream>,
+}
+
+/// Result of generating a positional method
+pub(crate) struct PositionalMethodResult {
+    /// Enum definitions that need to be placed at module level (outside impl blocks)
+    pub enum_definitions: Vec<TokenStream>,
+    /// The method implementation to be placed inside impl Client
+    pub method_impl: TokenStream,
+}
+
+/// Result of generating a builder struct
+pub(crate) struct BuilderStructResult {
+    /// Enum definitions that need to be placed at module level (outside impl blocks)
+    pub enum_definitions: Vec<TokenStream>,
+    /// The builder struct and impl to be placed at module level
+    pub builder_impl: TokenStream,
 }
 
 struct BuilderImpl {
@@ -280,6 +298,104 @@ impl OperationResponseKind {
             }
         }
     }
+}
+
+/// Information about a variant in a multi-response enum
+#[derive(Debug, Clone)]
+pub(crate) struct ResponseEnumVariant {
+    pub status_code: OperationResponseStatus,
+    pub variant_name: proc_macro2::Ident,
+    pub inner_type: OperationResponseKind,
+}
+
+/// Represents the unified response type for a method, which may be a single type
+/// or an enum of multiple types
+#[derive(Debug, Clone)]
+pub(crate) enum ResponseTypeInfo {
+    /// A single response type
+    Single(OperationResponseKind),
+    /// Multiple response types unified into an enum
+    Enum {
+        enum_name: proc_macro2::Ident,
+        variants: Vec<ResponseEnumVariant>,
+    },
+}
+
+impl ResponseTypeInfo {
+    /// Get the type tokens for use in function signatures
+    pub fn type_tokens(&self, type_space: &TypeSpace) -> TokenStream {
+        match self {
+            ResponseTypeInfo::Single(kind) => kind.clone().into_tokens(type_space),
+            ResponseTypeInfo::Enum { enum_name, .. } => quote! { #enum_name },
+        }
+    }
+
+    /// Generate the enum definition if this is a multi-type response
+    pub fn enum_definition(&self, type_space: &TypeSpace) -> Option<TokenStream> {
+        match self {
+            ResponseTypeInfo::Single(_) => None,
+            ResponseTypeInfo::Enum { enum_name, variants } => {
+                let variant_defs = variants.iter().map(|v| {
+                    let variant_name = &v.variant_name;
+                    let inner_type = v.inner_type.clone().into_tokens(type_space);
+                    quote! { #variant_name(#inner_type) }
+                });
+
+                // Check if any variant contains ByteStream (Raw type) which doesn't implement Debug
+                let has_non_debug = variants.iter().any(|v| {
+                    matches!(v.inner_type, OperationResponseKind::Raw)
+                });
+
+                if has_non_debug {
+                    // Generate enum without derive(Debug) and with manual Debug impl
+                    let debug_arms = variants.iter().map(|v| {
+                        let variant_name = &v.variant_name;
+                        let variant_str = variant_name.to_string();
+                        if matches!(v.inner_type, OperationResponseKind::Raw) {
+                            quote! {
+                                Self::#variant_name(_) => f.debug_tuple(#variant_str).field(&"<ByteStream>").finish()
+                            }
+                        } else {
+                            quote! {
+                                Self::#variant_name(inner) => f.debug_tuple(#variant_str).field(inner).finish()
+                            }
+                        }
+                    });
+                    Some(quote! {
+                        pub enum #enum_name {
+                            #(#variant_defs),*
+                        }
+
+                        impl ::std::fmt::Debug for #enum_name {
+                            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                                match self {
+                                    #(#debug_arms),*
+                                }
+                            }
+                        }
+                    })
+                } else {
+                    Some(quote! {
+                        #[derive(Debug)]
+                        pub enum #enum_name {
+                            #(#variant_defs),*
+                        }
+                    })
+                }
+            }
+        }
+    }
+
+    /// Find the variant for a given status code (for match arm generation)
+    pub fn variant_for_status(&self, status: &OperationResponseStatus) -> Option<&ResponseEnumVariant> {
+        match self {
+            ResponseTypeInfo::Single(_) => None,
+            ResponseTypeInfo::Enum { variants, .. } => {
+                variants.iter().find(|v| &v.status_code == status)
+            }
+        }
+    }
+
 }
 
 impl Generator {
@@ -552,7 +668,7 @@ impl Generator {
         &mut self,
         method: &OperationMethod,
         has_inner: bool,
-    ) -> Result<TokenStream> {
+    ) -> Result<PositionalMethodResult> {
         let operation_id = format_ident!("{}", method.operation_id);
 
         // Render each parameter as it will appear in the method signature.
@@ -609,6 +725,7 @@ impl Generator {
             success: success_type,
             error: error_type,
             body,
+            enum_definitions,
         } = self.method_sig_body(method, quote! { Self }, quote! { self }, has_inner)?;
 
         let method_impl = quote! {
@@ -752,12 +869,15 @@ impl Generator {
             }
         });
 
-        let all = quote! {
+        let method_impl_combined = quote! {
             #method_impl
             #stream_impl
         };
 
-        Ok(all)
+        Ok(PositionalMethodResult {
+            enum_definitions,
+            method_impl: method_impl_combined,
+        })
     }
 
     /// Common code generation between positional and builder interface-styles.
@@ -927,8 +1047,8 @@ impl Generator {
         // ... and there can be at most one body.
         assert!(body_func.clone().count() <= 1);
 
-        let (success_response_items, response_type) =
-            self.extract_responses(method, OperationResponseStatus::is_success_or_default);
+        let (success_response_items, success_type_info) =
+            self.extract_responses(method, OperationResponseStatus::is_success_or_default, "Success");
 
         let success_response_matches = success_response_items.iter().map(|response| {
             let pat = match &response.status_code {
@@ -938,35 +1058,39 @@ impl Generator {
                 }
             };
 
-            let decode = match &response.typ {
+            let base_decode = match &response.typ {
                 OperationResponseKind::Type(_) => {
-                    quote! {
-                        ResponseValue::from_response(#response_ident).await
-                    }
+                    quote! { ResponseValue::from_response(#response_ident).await }
                 }
                 OperationResponseKind::None => {
-                    quote! {
-                        Ok(ResponseValue::empty(#response_ident))
-                    }
+                    quote! { Ok(ResponseValue::empty(#response_ident)) }
                 }
                 OperationResponseKind::Raw => {
-                    quote! {
-                        Ok(ResponseValue::stream(#response_ident))
-                    }
+                    quote! { Ok(ResponseValue::stream(#response_ident)) }
                 }
                 OperationResponseKind::Upgrade => {
-                    quote! {
-                        ResponseValue::upgrade(#response_ident).await
-                    }
+                    quote! { ResponseValue::upgrade(#response_ident).await }
                 }
+            };
+
+            // If we have an enum type, wrap the decoded value in the appropriate variant
+            let decode = if let Some(variant) = success_type_info.variant_for_status(&response.status_code) {
+                let variant_name = &variant.variant_name;
+                if let ResponseTypeInfo::Enum { enum_name, .. } = &success_type_info {
+                    quote! { #base_decode.map(|rv| rv.map(#enum_name::#variant_name)) }
+                } else {
+                    base_decode
+                }
+            } else {
+                base_decode
             };
 
             quote! { #pat => { #decode } }
         });
 
         // Errors...
-        let (error_response_items, error_type) =
-            self.extract_responses(method, OperationResponseStatus::is_error_or_default);
+        let (error_response_items, error_type_info) =
+            self.extract_responses(method, OperationResponseStatus::is_error_or_default, "Error");
 
         let error_response_matches = error_response_items.iter().map(|response| {
             let pat = match &response.status_code {
@@ -984,28 +1108,15 @@ impl Generator {
                 }
             };
 
-            let decode = match &response.typ {
+            let base_decode = match &response.typ {
                 OperationResponseKind::Type(_) => {
-                    quote! {
-                        Err(Error::ErrorResponse(
-                            ResponseValue::from_response(#response_ident)
-                                .await?
-                        ))
-                    }
+                    quote! { ResponseValue::from_response(#response_ident).await? }
                 }
                 OperationResponseKind::None => {
-                    quote! {
-                        Err(Error::ErrorResponse(
-                            ResponseValue::empty(#response_ident)
-                        ))
-                    }
+                    quote! { ResponseValue::empty(#response_ident) }
                 }
                 OperationResponseKind::Raw => {
-                    quote! {
-                        Err(Error::ErrorResponse(
-                            ResponseValue::stream(#response_ident)
-                        ))
-                    }
+                    quote! { ResponseValue::stream(#response_ident) }
                 }
                 OperationResponseKind::Upgrade => {
                     if response.status_code == OperationResponseStatus::Default {
@@ -1019,15 +1130,31 @@ impl Generator {
                 }
             };
 
+            // If we have an enum type, wrap the decoded value in the appropriate variant
+            let decode = if let Some(variant) = error_type_info.variant_for_status(&response.status_code) {
+                let variant_name = &variant.variant_name;
+                if let ResponseTypeInfo::Enum { enum_name, .. } = &error_type_info {
+                    quote! { Err(Error::ErrorResponse(#base_decode.map(#enum_name::#variant_name))) }
+                } else {
+                    quote! { Err(Error::ErrorResponse(#base_decode)) }
+                }
+            } else {
+                quote! { Err(Error::ErrorResponse(#base_decode)) }
+            };
+
             quote! { #pat => { #decode } }
         });
 
-        let accept_header = matches!(
-            (&response_type, &error_type),
-            (OperationResponseKind::Type(_), _)
-                | (OperationResponseKind::None, OperationResponseKind::Type(_))
-        )
-        .then(|| {
+        // Determine if we need Accept header based on response types
+        let needs_accept_header = match (&success_type_info, &error_type_info) {
+            (ResponseTypeInfo::Single(OperationResponseKind::Type(_)), _) => true,
+            (ResponseTypeInfo::Single(OperationResponseKind::None), ResponseTypeInfo::Single(OperationResponseKind::Type(_))) => true,
+            (ResponseTypeInfo::Enum { .. }, _) => true,
+            (_, ResponseTypeInfo::Enum { .. }) => true,
+            _ => false,
+        };
+
+        let accept_header = needs_accept_header.then(|| {
             quote! {
                     .header(
                         ::reqwest::header::ACCEPT,
@@ -1158,22 +1285,33 @@ impl Generator {
             }
         };
 
+        // Collect enum definitions if any
+        let mut enum_definitions = Vec::new();
+        if let Some(def) = success_type_info.enum_definition(&self.type_space) {
+            enum_definitions.push(def);
+        }
+        if let Some(def) = error_type_info.enum_definition(&self.type_space) {
+            enum_definitions.push(def);
+        }
+
         Ok(MethodSigBody {
-            success: response_type.into_tokens(&self.type_space),
-            error: error_type.into_tokens(&self.type_space),
+            success: success_type_info.type_tokens(&self.type_space),
+            error: error_type_info.type_tokens(&self.type_space),
             body: body_impl,
+            enum_definitions,
         })
     }
 
     /// Extract responses that match criteria specified by the `filter`. The
     /// result is a `Vec<OperationResponse>` that enumerates the cases matching
-    /// the filter, and a `TokenStream` that represents the generated type for
-    /// those cases.
+    /// the filter, and a `ResponseTypeInfo` that represents the generated type
+    /// for those cases (either a single type or an enum of multiple types).
     pub(crate) fn extract_responses<'a>(
         &self,
         method: &'a OperationMethod,
         filter: fn(&OperationResponseStatus) -> bool,
-    ) -> (Vec<&'a OperationResponse>, OperationResponseKind) {
+        response_kind: &str, // "Success" or "Error" for enum naming
+    ) -> (Vec<&'a OperationResponse>, ResponseTypeInfo) {
         let mut response_items = method
             .responses
             .iter()
@@ -1206,15 +1344,39 @@ impl Generator {
             .map(|response| response.typ.clone())
             .collect::<BTreeSet<_>>();
 
-        // TODO to deal with multiple response types, we'll need to create an
-        // enum type with variants for each of the response types.
-        assert!(response_types.len() <= 1);
-        let response_type = response_types
-            .into_iter()
-            .next()
-            // TODO should this be OperationResponseType::Raw?
-            .unwrap_or(OperationResponseKind::None);
-        (response_items, response_type)
+        // If all responses have the same type, use that single type
+        let response_type_info = if response_types.len() <= 1 {
+            ResponseTypeInfo::Single(
+                response_types.into_iter().next().unwrap_or(OperationResponseKind::None)
+            )
+        } else {
+            // Multiple different types - generate an enum
+            let enum_name = format_ident!(
+                "{}{}",
+                sanitize(&method.operation_id, Case::Pascal),
+                response_kind
+            );
+
+            let variants = response_items
+                .iter()
+                .map(|response| {
+                    let variant_name = match &response.status_code {
+                        OperationResponseStatus::Code(code) => format_ident!("Status{}", code),
+                        OperationResponseStatus::Range(r) => format_ident!("Status{}xx", r),
+                        OperationResponseStatus::Default => format_ident!("Default"),
+                    };
+                    ResponseEnumVariant {
+                        status_code: response.status_code.clone(),
+                        variant_name,
+                        inner_type: response.typ.clone(),
+                    }
+                })
+                .collect();
+
+            ResponseTypeInfo::Enum { enum_name, variants }
+        };
+
+        (response_items, response_type_info)
     }
 
     // Validates all the necessary conditions for Dropshot pagination. Returns
@@ -1416,7 +1578,7 @@ impl Generator {
         method: &OperationMethod,
         tag_style: TagStyle,
         has_inner: bool,
-    ) -> Result<TokenStream> {
+    ) -> Result<BuilderStructResult> {
         let struct_name = sanitize(&method.operation_id, Case::Pascal);
         let struct_ident = format_ident!("{}", struct_name);
 
@@ -1653,6 +1815,7 @@ impl Generator {
             success,
             error,
             body,
+            enum_definitions,
         } = self.method_sig_body(
             method,
             quote! { super::Client },
@@ -1856,7 +2019,7 @@ impl Generator {
             }
         };
 
-        Ok(quote! {
+        let builder_impl = quote! {
             #[doc = #struct_doc]
             #derive
             pub struct #struct_ident<'a> {
@@ -1876,6 +2039,11 @@ impl Generator {
                 #send_impl
                 #stream_impl
             }
+        };
+
+        Ok(BuilderStructResult {
+            enum_definitions,
+            builder_impl,
         })
     }
 
@@ -2321,5 +2489,255 @@ impl ParameterDataExt for openapiv3::ParameterData {
                 format!("unexpected content {:#?}", c),
             )),
         }
+    }
+}
+
+// OpenAPI 3.1 support
+#[cfg(feature = "openapi-3-1")]
+impl Generator {
+    /// Process an operation from an OpenAPI 3.1 spec
+    pub(crate) fn process_operation_3_1(
+        &mut self,
+        operation: &openapiv3_1::path::Operation,
+        components: &Option<openapiv3_1::Components>,
+        path: &str,
+        method: &str,
+        path_parameters: &Option<Vec<openapiv3_1::path::Parameter>>,
+    ) -> Result<OperationMethod> {
+        let operation_id = operation
+            .operation_id
+            .as_ref()
+            .ok_or_else(|| Error::UnexpectedFormat("missing operation_id".to_string()))?;
+
+        // Combine path and operation parameters
+        let mut params = Vec::new();
+
+        // Process path-level parameters
+        if let Some(path_params) = path_parameters {
+            for param in path_params {
+                if let Some(op_param) = self.convert_parameter_3_1(param, operation_id, components)? {
+                    params.push(op_param);
+                }
+            }
+        }
+
+        // Process operation-level parameters (may override path-level)
+        if let Some(op_params) = &operation.parameters {
+            for param in op_params {
+                if let Some(op_param) = self.convert_parameter_3_1(param, operation_id, components)? {
+                    // Remove any path parameter with the same name
+                    params.retain(|p| p.api_name != op_param.api_name);
+                    params.push(op_param);
+                }
+            }
+        }
+
+        // Process request body
+        if let Some(request_body) = &operation.request_body {
+            if let Some(body_param) = self.get_body_param_3_1(request_body, operation_id, components)? {
+                params.push(body_param);
+            }
+        }
+
+        let tmp = crate::template::parse(path)?;
+        let names = tmp.names();
+        sort_params(&mut params, &names);
+
+        // Process responses
+        let mut responses = Vec::new();
+        for (status_code, response) in &operation.responses.responses {
+            if let Some(op_response) =
+                self.convert_response_3_1(status_code, response, operation_id, components)?
+            {
+                responses.push(op_response);
+            }
+        }
+
+        Ok(OperationMethod {
+            operation_id: operation_id.clone(),
+            tags: operation.tags.clone().unwrap_or_default(),
+            method: HttpMethod::from_str(&method.to_lowercase())?,
+            path: tmp,
+            summary: operation.summary.clone(),
+            description: operation.description.clone(),
+            params,
+            responses,
+            dropshot_paginated: None, // TODO: implement dropshot extension support
+            dropshot_websocket: false,
+        })
+    }
+
+    fn convert_parameter_3_1(
+        &mut self,
+        param: &openapiv3_1::path::Parameter,
+        operation_id: &str,
+        _components: &Option<openapiv3_1::Components>,
+    ) -> Result<Option<OperationParameter>> {
+        use crate::to_schema::ToSchema;
+        use crate::util::{sanitize, Case};
+
+        let schema = match &param.schema {
+            Some(s) => s.to_schema(),
+            None => return Ok(None),
+        };
+
+        let name = sanitize(&format!("{}-{}", operation_id, &param.name), Case::Pascal);
+        let typ = self.type_space.add_type_with_name(&schema, Some(name))?;
+
+        let kind = match param.parameter_in {
+            openapiv3_1::path::ParameterIn::Path => OperationParameterKind::Path,
+            openapiv3_1::path::ParameterIn::Query => {
+                // Check if the type is optional
+                let ty = self.type_space.get_type(&typ).unwrap();
+                let details = ty.details();
+                let required = if let typify::TypeDetails::Option(_) = details {
+                    false
+                } else {
+                    param.required
+                };
+                OperationParameterKind::Query(required)
+            }
+            openapiv3_1::path::ParameterIn::Header => {
+                OperationParameterKind::Header(param.required)
+            }
+            openapiv3_1::path::ParameterIn::Cookie => {
+                return Err(Error::UnexpectedFormat(
+                    "cookie parameters are not supported".to_string(),
+                ));
+            }
+        };
+
+        Ok(Some(OperationParameter {
+            name: sanitize(&param.name, Case::Snake),
+            api_name: param.name.clone(),
+            description: param.description.clone(),
+            typ: OperationParameterType::Type(typ),
+            kind,
+        }))
+    }
+
+    fn get_body_param_3_1(
+        &mut self,
+        request_body: &openapiv3_1::request_body::RequestBody,
+        operation_id: &str,
+        _components: &Option<openapiv3_1::Components>,
+    ) -> Result<Option<OperationParameter>> {
+        use crate::to_schema::ToSchema;
+        use crate::util::{sanitize, Case};
+
+        // Get the first content type (prefer application/json)
+        let content = request_body
+            .content
+            .get("application/json")
+            .or_else(|| request_body.content.values().next());
+
+        let Some(media_type) = content else {
+            return Ok(None);
+        };
+
+        let Some(schema) = &media_type.schema else {
+            return Ok(None);
+        };
+
+        let schema = schema.to_schema();
+        let name = sanitize(&format!("{}-body", operation_id), Case::Pascal);
+        let typ = self.type_space.add_type_with_name(&schema, Some(name))?;
+
+        // Determine body content type
+        let body_content_type = if request_body.content.contains_key("application/json") {
+            BodyContentType::Json
+        } else if request_body.content.contains_key("application/octet-stream") {
+            BodyContentType::OctetStream
+        } else if request_body.content.contains_key("application/x-www-form-urlencoded") {
+            BodyContentType::FormUrlencoded
+        } else if request_body.content.contains_key("text/plain") {
+            BodyContentType::Text("text/plain".to_string())
+        } else {
+            BodyContentType::Json // Default
+        };
+
+        Ok(Some(OperationParameter {
+            name: "body".to_string(),
+            api_name: "body".to_string(),
+            description: request_body.description.clone(),
+            typ: OperationParameterType::Type(typ),
+            kind: OperationParameterKind::Body(body_content_type),
+        }))
+    }
+
+    fn convert_response_3_1(
+        &mut self,
+        status_code: &str,
+        response: &openapiv3_1::RefOr<openapiv3_1::Response>,
+        operation_id: &str,
+        _components: &Option<openapiv3_1::Components>,
+    ) -> Result<Option<OperationResponse>> {
+        use crate::to_schema::ToSchema;
+        use crate::util::{sanitize, Case};
+
+        let response = match response {
+            openapiv3_1::RefOr::Ref(r) => {
+                // TODO: resolve reference
+                return Err(Error::UnexpectedFormat(format!(
+                    "response reference not yet supported: {}",
+                    r.ref_location
+                )));
+            }
+            openapiv3_1::RefOr::T(r) => r,
+        };
+
+        // Parse status code
+        let status = if status_code == "default" {
+            OperationResponseStatus::Default
+        } else if let Ok(code) = status_code.parse::<u16>() {
+            OperationResponseStatus::Code(code)
+        } else if status_code.ends_with("XX") || status_code.ends_with("xx") {
+            let first = status_code
+                .chars()
+                .next()
+                .and_then(|c| c.to_digit(10))
+                .map(|d| d as u16);
+            if let Some(first) = first {
+                OperationResponseStatus::Range(first)
+            } else {
+                return Ok(None);
+            }
+        } else {
+            return Ok(None);
+        };
+
+        // Get response content type and schema
+        // Logic matches 3.0 code: JSON types are parsed, non-JSON content is Raw, no content is None
+        let json_content = response.content.iter().find_map(|(content_type, media)| {
+            (content_type == "application/json" || content_type.starts_with("application/json;"))
+                .then_some(media)
+        });
+
+        let typ = if let Some(media_type) = json_content {
+            // JSON content type - parse schema
+            if let Some(schema) = &media_type.schema {
+                let schema = schema.to_schema();
+                let name = sanitize(
+                    &format!("{}-{}-response", operation_id, status_code),
+                    Case::Pascal,
+                );
+                let type_id = self.type_space.add_type_with_name(&schema, Some(name))?;
+                OperationResponseKind::Type(type_id)
+            } else {
+                OperationResponseKind::None
+            }
+        } else if !response.content.is_empty() {
+            // Non-JSON content type - return as raw byte stream
+            OperationResponseKind::Raw
+        } else {
+            // No content
+            OperationResponseKind::None
+        };
+
+        Ok(Some(OperationResponse {
+            status_code: status,
+            typ,
+            description: Some(response.description.clone()),
+        }))
     }
 }

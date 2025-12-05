@@ -208,10 +208,20 @@ impl Generator {
         let fn_name = format_ident!("execute_{}", &method.operation_id);
         let op_name = format_ident!("{}", &method.operation_id);
 
-        let (_, success_kind) =
-            self.extract_responses(method, OperationResponseStatus::is_success_or_default);
-        let (_, error_kind) =
-            self.extract_responses(method, OperationResponseStatus::is_error_or_default);
+        let (_, success_type_info) =
+            self.extract_responses(method, OperationResponseStatus::is_success_or_default, "Success");
+        let (_, error_type_info) =
+            self.extract_responses(method, OperationResponseStatus::is_error_or_default, "Error");
+
+        // Extract the underlying kind for CLI compatibility
+        let success_kind = match &success_type_info {
+            crate::method::ResponseTypeInfo::Single(kind) => kind.clone(),
+            crate::method::ResponseTypeInfo::Enum { .. } => crate::method::OperationResponseKind::None,
+        };
+        let error_kind = match &error_type_info {
+            crate::method::ResponseTypeInfo::Single(kind) => kind.clone(),
+            crate::method::ResponseTypeInfo::Enum { .. } => crate::method::OperationResponseKind::None,
+        };
 
         let execute_and_output = match method.dropshot_paginated {
             // Normal, one-shot API calls.

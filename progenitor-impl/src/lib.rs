@@ -25,6 +25,8 @@ mod httpmock;
 mod method;
 mod template;
 mod to_schema;
+#[cfg(feature = "openapi-3-1")]
+mod to_schema_3_1;
 mod util;
 
 #[allow(missing_docs)]
@@ -525,16 +527,23 @@ impl Generator {
         input_methods: &[method::OperationMethod],
         has_inner: bool,
     ) -> Result<TokenStream> {
-        let methods = input_methods
+        let results = input_methods
             .iter()
             .map(|method| self.positional_method(method, has_inner))
             .collect::<Result<Vec<_>>>()?;
+
+        // Separate enum definitions (to be placed at module level) from method impls
+        let enum_definitions: Vec<_> = results.iter().flat_map(|r| r.enum_definitions.iter().cloned()).collect();
+        let methods: Vec<_> = results.iter().map(|r| r.method_impl.clone()).collect();
 
         // The allow(unused_imports) on the `pub use` is necessary with Rust
         // 1.76+, in case the generated file is not at the top level of the
         // crate.
 
         let out = quote! {
+            // Response enums for operations with multiple response types
+            #(#enum_definitions)*
+
             #[allow(clippy::all)]
             impl Client {
                 #(#methods)*
@@ -554,10 +563,14 @@ impl Generator {
         input_methods: &[method::OperationMethod],
         has_inner: bool,
     ) -> Result<TokenStream> {
-        let builder_struct = input_methods
+        let builder_results = input_methods
             .iter()
             .map(|method| self.builder_struct(method, TagStyle::Merged, has_inner))
             .collect::<Result<Vec<_>>>()?;
+
+        // Separate enum definitions from builder impls
+        let enum_definitions: Vec<_> = builder_results.iter().flat_map(|r| r.enum_definitions.iter().cloned()).collect();
+        let builder_struct: Vec<_> = builder_results.iter().map(|r| r.builder_impl.clone()).collect();
 
         let builder_methods = input_methods
             .iter()
@@ -585,6 +598,9 @@ impl Generator {
                     ResponseValue,
                 };
 
+                // Response enums for operations with multiple response types
+                #(#enum_definitions)*
+
                 #(#builder_struct)*
             }
 
@@ -603,10 +619,16 @@ impl Generator {
         tag_info: BTreeMap<&String, &openapiv3::Tag>,
         has_inner: bool,
     ) -> Result<TokenStream> {
-        let builder_struct = input_methods
+        let results = input_methods
             .iter()
             .map(|method| self.builder_struct(method, TagStyle::Separate, has_inner))
             .collect::<Result<Vec<_>>>()?;
+
+        let enum_definitions: Vec<_> = results
+            .iter()
+            .flat_map(|r| r.enum_definitions.iter().cloned())
+            .collect();
+        let builder_structs: Vec<_> = results.iter().map(|r| r.builder_impl.clone()).collect();
 
         let (traits_and_impls, trait_preludes) = self.builder_tags(input_methods, &tag_info);
 
@@ -616,6 +638,8 @@ impl Generator {
 
         let out = quote! {
             #traits_and_impls
+
+            #(#enum_definitions)*
 
             /// Types for composing operation parameters.
             #[allow(clippy::all)]
@@ -633,7 +657,7 @@ impl Generator {
                     ResponseValue,
                 };
 
-                #(#builder_struct)*
+                #(#builder_structs)*
             }
 
             /// Items consumers will typically use such as the Client and
@@ -664,6 +688,279 @@ impl Generator {
     pub fn uses_websockets(&self) -> bool {
         self.uses_websockets
     }
+
+    /// Emit a [TokenStream] containing the generated client code from an OpenAPI 3.1 spec.
+    #[cfg(feature = "openapi-3-1")]
+    pub fn generate_tokens_3_1(
+        &mut self,
+        spec: &openapiv3_1::OpenApi,
+    ) -> Result<TokenStream> {
+        validate_openapi_3_1(spec)?;
+
+        // Convert our components dictionary to schemars
+        let schemas = spec.components.iter().flat_map(|components| {
+            components
+                .schemas
+                .iter()
+                .map(|(name, ref_or_schema)| (name.clone(), ref_or_schema.to_schema()))
+        });
+
+        self.type_space.add_ref_types(schemas)?;
+
+        let raw_methods = spec
+            .paths
+            .paths
+            .iter()
+            .flat_map(|(path, path_item)| {
+                iter_path_item_operations(path_item)
+                    .map(move |(method, operation)| (path.as_str(), method, operation, &path_item.parameters))
+            })
+            .map(|(path, method, operation, path_parameters)| {
+                self.process_operation_3_1(operation, &spec.components, path, method, path_parameters)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let operation_code = match (&self.settings.interface, &self.settings.tag) {
+            (InterfaceStyle::Positional, TagStyle::Merged) => self
+                .generate_tokens_positional_merged(
+                    &raw_methods,
+                    self.settings.inner_type.is_some(),
+                ),
+            (InterfaceStyle::Positional, TagStyle::Separate) => {
+                unimplemented!("positional arguments with separate tags are currently unsupported")
+            }
+            (InterfaceStyle::Builder, TagStyle::Merged) => self
+                .generate_tokens_builder_merged(&raw_methods, self.settings.inner_type.is_some()),
+            (InterfaceStyle::Builder, TagStyle::Separate) => {
+                let tag_info = spec
+                    .tags
+                    .as_ref()
+                    .map(|tags| {
+                        tags.iter()
+                            .map(|tag| (&tag.name, tag))
+                            .collect::<BTreeMap<_, _>>()
+                    })
+                    .unwrap_or_default();
+                self.generate_tokens_builder_separate_3_1(
+                    &raw_methods,
+                    tag_info,
+                    self.settings.inner_type.is_some(),
+                )
+            }
+        }?;
+
+        let types = self.type_space.to_stream();
+
+        let (inner_type, inner_fn_value) = match self.settings.inner_type.as_ref() {
+            Some(inner_type) => (inner_type.clone(), quote! { &self.inner }),
+            None => (quote! { () }, quote! { &() }),
+        };
+
+        let inner_property = self.settings.inner_type.as_ref().map(|inner| {
+            quote! {
+                pub (crate) inner: #inner,
+            }
+        });
+        let inner_parameter = self.settings.inner_type.as_ref().map(|inner| {
+            quote! {
+                inner: #inner,
+            }
+        });
+        let inner_value = self.settings.inner_type.as_ref().map(|_| {
+            quote! {
+                inner
+            }
+        });
+        let client_timeout = self.settings.timeout.unwrap_or(15);
+
+        let client_docstring = {
+            let mut s = format!("Client for {}", spec.info.title);
+
+            if let Some(desc) = &spec.info.description {
+                if !desc.is_empty() {
+                    s.push_str("\n\n");
+                    s.push_str(desc);
+                }
+            }
+            if let Some(ss) = &spec.info.terms_of_service {
+                s.push_str("\n\n");
+                s.push_str(ss);
+            }
+
+            s.push_str(&format!("\n\nVersion: {}", &spec.info.version));
+
+            s
+        };
+
+        let version_str = &spec.info.version;
+
+        let file = quote! {
+            // Re-export types that are used by the public interface of Client.
+            #[allow(unused_imports)]
+            pub use progenitor_client::{
+                ByteStream,
+                ClientInfo,
+                Error,
+                ResponseValue,
+            };
+            #[allow(unused_imports)]
+            use progenitor_client::{
+                encode_path,
+                ClientHooks,
+                OperationInfo,
+                RequestBuilderExt,
+            };
+
+            /// Types used as operation parameters and responses.
+            #[allow(clippy::all)]
+            pub mod types {
+                #types
+            }
+
+            #[derive(Clone, Debug)]
+            #[doc = #client_docstring]
+            pub struct Client {
+                pub(crate) baseurl: String,
+                pub(crate) client: reqwest::Client,
+                #inner_property
+            }
+
+            impl Client {
+                /// Create a new client.
+                ///
+                /// `baseurl` is the base URL provided to the internal
+                /// `reqwest::Client`, and should include a scheme and hostname,
+                /// as well as port and a path stem if applicable.
+                pub fn new(
+                    baseurl: &str,
+                    #inner_parameter
+                ) -> Self {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let client = {
+                        let dur = ::std::time::Duration::from_secs(#client_timeout);
+
+                        reqwest::ClientBuilder::new()
+                            .connect_timeout(dur)
+                            .timeout(dur)
+                    };
+
+                    #[cfg(target_arch = "wasm32")]
+                    let client = reqwest::ClientBuilder::new();
+
+                    Self::new_with_client(baseurl, client.build().unwrap(), #inner_value)
+                }
+
+                /// Construct a new client with an existing `reqwest::Client`,
+                /// allowing more control over its configuration.
+                ///
+                /// `baseurl` is the base URL provided to the internal
+                /// `reqwest::Client`, and should include a scheme and hostname,
+                /// as well as port and a path stem if applicable.
+                pub fn new_with_client(
+                    baseurl: &str,
+                    client: reqwest::Client,
+                    #inner_parameter
+                ) -> Self {
+                    Self {
+                        baseurl: baseurl.to_string(),
+                        client,
+                        #inner_value
+                    }
+                }
+            }
+
+            impl ClientInfo<#inner_type> for Client {
+                fn api_version() -> &'static str {
+                    #version_str
+                }
+
+                fn baseurl(&self) -> &str {
+                    self.baseurl.as_str()
+                }
+
+                fn client(&self) -> &reqwest::Client {
+                    &self.client
+                }
+
+                fn inner(&self) -> &#inner_type {
+                    #inner_fn_value
+                }
+            }
+
+            impl ClientHooks<#inner_type> for &Client {}
+
+            #operation_code
+        };
+
+        Ok(file)
+    }
+
+    #[cfg(feature = "openapi-3-1")]
+    fn generate_tokens_builder_separate_3_1(
+        &mut self,
+        input_methods: &[method::OperationMethod],
+        tag_info: BTreeMap<&String, &openapiv3_1::Tag>,
+        has_inner: bool,
+    ) -> Result<TokenStream> {
+        let results = input_methods
+            .iter()
+            .map(|method| self.builder_struct(method, TagStyle::Separate, has_inner))
+            .collect::<Result<Vec<_>>>()?;
+
+        let enum_definitions: Vec<_> = results
+            .iter()
+            .flat_map(|r| r.enum_definitions.iter().cloned())
+            .collect();
+        let builder_structs: Vec<_> = results.iter().map(|r| r.builder_impl.clone()).collect();
+
+        let (traits_and_impls, trait_preludes) = self.builder_tags_3_1(input_methods, &tag_info);
+
+        let out = quote! {
+            #traits_and_impls
+
+            #(#enum_definitions)*
+
+            /// Types for composing operation parameters.
+            #[allow(clippy::all)]
+            pub mod builder {
+                use super::types;
+                #[allow(unused_imports)]
+                use super::{
+                    encode_path,
+                    ByteStream,
+                    ClientInfo,
+                    ClientHooks,
+                    Error,
+                    OperationInfo,
+                    RequestBuilderExt,
+                    ResponseValue,
+                };
+
+                #(#builder_structs)*
+            }
+
+            /// Items consumers will typically use such as the Client and
+            /// extension traits.
+            pub mod prelude {
+                #[allow(unused_imports)]
+                pub use super::Client;
+                #trait_preludes
+            }
+        };
+
+        Ok(out)
+    }
+
+    #[cfg(feature = "openapi-3-1")]
+    fn builder_tags_3_1(
+        &self,
+        _input_methods: &[method::OperationMethod],
+        _tag_info: &BTreeMap<&String, &openapiv3_1::Tag>,
+    ) -> (TokenStream, TokenStream) {
+        // TODO: Implement tag-based trait generation for 3.1
+        // For now, return empty token streams
+        (quote! {}, quote! {})
+    }
 }
 
 /// Add newlines after end-braces at <= two levels of indentation.
@@ -678,12 +975,24 @@ pub fn space_out_items(content: String) -> Result<String> {
 }
 
 fn validate_openapi_spec_version(spec_version: &str) -> Result<()> {
-    // progenitor currenlty only support OAS 3.0.x
-    if spec_version.trim().starts_with("3.0.") {
+    let version = spec_version.trim();
+    if version.starts_with("3.0.") {
         Ok(())
+    } else if version.starts_with("3.1.") {
+        #[cfg(feature = "openapi-3-1")]
+        {
+            Ok(())
+        }
+        #[cfg(not(feature = "openapi-3-1"))]
+        {
+            Err(Error::UnexpectedFormat(format!(
+                "OpenAPI 3.1 support requires the 'openapi-3-1' feature: {}",
+                spec_version
+            )))
+        }
     } else {
         Err(Error::UnexpectedFormat(format!(
-            "invalid version: {}",
+            "unsupported OpenAPI version: {}",
             spec_version
         )))
     }
@@ -723,6 +1032,51 @@ pub fn validate_openapi(spec: &OpenAPI) -> Result<()> {
     })?;
 
     Ok(())
+}
+
+/// Do some very basic checks of the OpenAPI 3.1 documents.
+#[cfg(feature = "openapi-3-1")]
+pub fn validate_openapi_3_1(spec: &openapiv3_1::OpenApi) -> Result<()> {
+    let mut opids = HashSet::new();
+
+    for (path, path_item) in &spec.paths.paths {
+        for (method, operation) in iter_path_item_operations(path_item) {
+            if let Some(oid) = operation.operation_id.as_ref() {
+                if !opids.insert(oid.to_string()) {
+                    return Err(Error::UnexpectedFormat(format!(
+                        "duplicate operation ID: {}",
+                        oid,
+                    )));
+                }
+            } else {
+                return Err(Error::UnexpectedFormat(format!(
+                    "path {} {} is missing operation ID",
+                    method, path,
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Iterator over operations in a PathItem for OpenAPI 3.1
+#[cfg(feature = "openapi-3-1")]
+fn iter_path_item_operations(
+    path_item: &openapiv3_1::PathItem,
+) -> impl Iterator<Item = (&'static str, &openapiv3_1::path::Operation)> {
+    [
+        ("GET", path_item.get.as_ref()),
+        ("PUT", path_item.put.as_ref()),
+        ("POST", path_item.post.as_ref()),
+        ("DELETE", path_item.delete.as_ref()),
+        ("OPTIONS", path_item.options.as_ref()),
+        ("HEAD", path_item.head.as_ref()),
+        ("PATCH", path_item.patch.as_ref()),
+        ("TRACE", path_item.trace.as_ref()),
+    ]
+    .into_iter()
+    .filter_map(|(method, op)| op.map(|o| (method, o)))
 }
 
 #[cfg(test)]
@@ -769,11 +1123,21 @@ mod tests {
         assert!(validate_openapi_spec_version("3.0.1").is_ok());
         assert!(validate_openapi_spec_version("3.0.4").is_ok());
         assert!(validate_openapi_spec_version("3.0.5-draft").is_ok());
-        assert_eq!(
-            validate_openapi_spec_version("3.1.0")
-                .unwrap_err()
-                .to_string(),
-            "unexpected or unhandled format in the OpenAPI document invalid version: 3.1.0"
-        );
+
+        // 3.1.0 support depends on the openapi-3-1 feature
+        #[cfg(feature = "openapi-3-1")]
+        assert!(validate_openapi_spec_version("3.1.0").is_ok());
+
+        #[cfg(not(feature = "openapi-3-1"))]
+        assert!(validate_openapi_spec_version("3.1.0")
+            .unwrap_err()
+            .to_string()
+            .contains("OpenAPI 3.1 support requires"));
+
+        // Unsupported versions
+        assert!(validate_openapi_spec_version("2.0.0")
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported OpenAPI version"));
     }
 }
