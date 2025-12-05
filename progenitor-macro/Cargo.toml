@@ -16,7 +16,7 @@ openapi-3-1 = ["progenitor-impl/openapi-3-1", "dep:openapiv3_1"]
 
 [dependencies]
 openapiv3 = "2.2.0"
-openapiv3_1 = { path = "../../openapiv3_1_repo/crates/openapiv3_1", features = ["debug"], optional = true }
+openapiv3_1 = { workspace = true, optional = true }
 proc-macro2 = "1.0"
 progenitor-impl = { version = "0.11.2", path = "../progenitor-impl", default-features = false }
 quote = "1.0"
